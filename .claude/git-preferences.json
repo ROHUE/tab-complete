@@ -1,1 +1,7 @@
-{"gitInitAsked": true, "gitInitPreference": true}
+{
+  "gitInitAsked": true,
+  "gitInitPreference": true,
+  "remoteAsked": true,
+  "remotePreference": true,
+  "remoteUrl": "https://github.com/ROHUE/tab-complete"
+}
