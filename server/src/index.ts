@@ -2,55 +2,64 @@
  * Claude Completion LSP Server
  *
  * An LSP server that provides intelligent code completions powered by Claude.
+ * Uses dynamic import to avoid blocking at module load time.
  */
 
-import {
-  createConnection,
-  TextDocuments,
-  ProposedFeatures,
-  InitializeParams,
-  TextDocumentSyncKind,
-  InitializeResult,
-  CompletionItem,
-  CompletionItemKind,
-  TextDocumentPositionParams,
-} from "vscode-languageserver/node.js";
-
 import { TextDocument } from "vscode-languageserver-textdocument";
+import { CompletionItem, CompletionItemKind } from "vscode-languageserver-types";
 import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
-import { createCompletionServer, parseCompletions } from "./completion-tool.js";
+import { createCompletionServer, parseCompletions } from "./completion-tool";
 
-// Create LSP connection
-const connection = createConnection(ProposedFeatures.all);
+// Main function - dynamically import vscode-languageserver to avoid import blocking
+async function main() {
+  console.error("[claude-completion] Starting server...");
 
-// Document manager
-const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
+  // Dynamic import to avoid blocking at module load
+  const {
+    createConnection,
+    TextDocuments,
+    ProposedFeatures,
+    TextDocumentSyncKind,
+    StreamMessageReader,
+    StreamMessageWriter,
+  } = await import("vscode-languageserver/node");
 
-// Create the Claude completion MCP server
-const completionServer = createCompletionServer();
+  console.error("[claude-completion] Creating connection...");
 
-// Initialize
-connection.onInitialize((_params: InitializeParams): InitializeResult => {
-  console.error("[claude-completion] Server initializing...");
+  // Create LSP connection with explicit stdio streams
+  const connection = createConnection(
+    ProposedFeatures.all,
+    new StreamMessageReader(process.stdin),
+    new StreamMessageWriter(process.stdout)
+  );
 
-  return {
-    capabilities: {
-      textDocumentSync: TextDocumentSyncKind.Incremental,
-      completionProvider: {
-        resolveProvider: false,
-        triggerCharacters: [".", "(", "[", "{", " ", ":", "<", '"', "'", "/"],
+  // Document manager
+  const documents = new TextDocuments(TextDocument);
+
+  // Create the Claude completion MCP server
+  const completionServer = createCompletionServer();
+
+  // Initialize
+  connection.onInitialize(() => {
+    console.error("[claude-completion] Server initializing...");
+
+    return {
+      capabilities: {
+        textDocumentSync: TextDocumentSyncKind.Incremental,
+        completionProvider: {
+          resolveProvider: false,
+          triggerCharacters: [".", "(", "[", "{", " ", ":", "<", '"', "'", "/"],
+        },
       },
-    },
-  };
-});
+    };
+  });
 
-connection.onInitialized(() => {
-  console.error("[claude-completion] Server initialized successfully");
-});
+  connection.onInitialized(() => {
+    console.error("[claude-completion] Server initialized successfully");
+  });
 
-// Handle completion requests
-connection.onCompletion(
-  async (params: TextDocumentPositionParams): Promise<CompletionItem[]> => {
+  // Handle completion requests
+  connection.onCompletion(async (params) => {
     const document = documents.get(params.textDocument.uri);
     if (!document) {
       return [];
@@ -116,12 +125,10 @@ Then analyze the code context and provide intelligent completions.`;
         options: sdkOptions,
       })) {
         if (message.type === "assistant") {
-          // SDKAssistantMessage has message.message which is BetaMessage
           const betaMessage = message.message;
           if (betaMessage && betaMessage.content) {
             for (const block of betaMessage.content) {
               if (block.type === "text") {
-                // Type assertion after narrowing by type check
                 const textBlock = block as { type: "text"; text: string };
                 completions = parseCompletions(textBlock.text);
                 break;
@@ -139,36 +146,42 @@ Then analyze the code context and provide intelligent completions.`;
       // Fallback: return basic buffer completions
       return getBasicCompletions(text, prefix);
     }
-  }
-);
+  });
 
-/**
- * Fallback: Get basic completions from buffer words
- */
-function getBasicCompletions(text: string, prefix: string): CompletionItem[] {
-  const words = new Set<string>();
-  const wordRegex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
-  let match;
+  /**
+   * Fallback: Get basic completions from buffer words
+   */
+  function getBasicCompletions(text: string, prefix: string): CompletionItem[] {
+    const words = new Set<string>();
+    const wordRegex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
+    let match;
 
-  while ((match = wordRegex.exec(text)) !== null) {
-    if (match[0].toLowerCase().startsWith(prefix.toLowerCase()) && match[0] !== prefix) {
-      words.add(match[0]);
+    while ((match = wordRegex.exec(text)) !== null) {
+      if (match[0].toLowerCase().startsWith(prefix.toLowerCase()) && match[0] !== prefix) {
+        words.add(match[0]);
+      }
     }
+
+    return Array.from(words)
+      .slice(0, 20)
+      .map((word) => ({
+        label: word,
+        kind: CompletionItemKind.Text,
+        detail: "(buffer)",
+      }));
   }
 
-  return Array.from(words)
-    .slice(0, 20)
-    .map((word) => ({
-      label: word,
-      kind: CompletionItemKind.Text,
-      detail: "(buffer)",
-    }));
+  // Listen for document changes
+  documents.listen(connection);
+
+  // Start the server
+  connection.listen();
+
+  console.error("[claude-completion] Server started");
 }
 
-// Listen for document changes
-documents.listen(connection);
-
-// Start the server
-connection.listen();
-
-console.error("[claude-completion] Server started");
+// Run the main function
+main().catch((err) => {
+  console.error("[claude-completion] Fatal error:", err);
+  process.exit(1);
+});

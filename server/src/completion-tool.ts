@@ -4,10 +4,7 @@
 
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import {
-  CompletionItem,
-  CompletionItemKind,
-} from "vscode-languageserver/node.js";
+import { CompletionItem, CompletionItemKind } from "vscode-languageserver-types";
 
 // Schema for completion request
 const CompletionRequestSchema = {
