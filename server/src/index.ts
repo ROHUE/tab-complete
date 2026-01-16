@@ -2,11 +2,16 @@
  * Claude Completion LSP Server
  *
  * An LSP server that provides intelligent code completions powered by Claude.
- * Uses vscode-jsonrpc directly to avoid blocking behavior in vscode-languageserver/node.
+ * Uses streaming for fast perceived latency - returns buffer completions immediately
+ * while Claude completions stream in via progress notifications.
  */
 
 import { TextDocument } from "vscode-languageserver-textdocument";
-import { CompletionItem, CompletionItemKind } from "vscode-languageserver-types";
+import {
+  CompletionItem,
+  CompletionItemKind,
+  CompletionList,
+} from "vscode-languageserver-types";
 import {
   createMessageConnection,
   StreamMessageReader,
@@ -29,6 +34,9 @@ console.error("[claude-completion] Starting server...");
 
 // Document storage (simple in-memory store)
 const documents = new Map<string, TextDocument>();
+
+// Track pending completion requests for cancellation
+const pendingRequests = new Map<string, AbortController>();
 
 // Create a simple JSON-RPC connection using explicit stdio
 const reader = new StreamMessageReader(process.stdin);
@@ -62,154 +70,44 @@ connection.onNotification(DidOpenTextDocumentNotification.type, (params) => {
 connection.onNotification(DidChangeTextDocumentNotification.type, (params) => {
   const doc = documents.get(params.textDocument.uri);
   if (doc) {
-    const updated = TextDocument.update(doc, params.contentChanges, params.textDocument.version);
+    const updated = TextDocument.update(
+      doc,
+      params.contentChanges,
+      params.textDocument.version
+    );
     documents.set(params.textDocument.uri, updated);
+  }
+
+  // Cancel any pending completion request for this document
+  const requestKey = params.textDocument.uri;
+  const pending = pendingRequests.get(requestKey);
+  if (pending) {
+    console.error(`[claude-completion] Cancelling pending request for ${requestKey}`);
+    pending.abort();
+    pendingRequests.delete(requestKey);
   }
 });
 
 // Handle document close
 connection.onNotification(DidCloseTextDocumentNotification.type, (params) => {
   documents.delete(params.textDocument.uri);
+  pendingRequests.delete(params.textDocument.uri);
   console.error(`[claude-completion] Document closed: ${params.textDocument.uri}`);
 });
 
-// Handle completion requests
-connection.onRequest(CompletionRequest.type, async (params): Promise<CompletionItem[]> => {
-  const document = documents.get(params.textDocument.uri);
-  if (!document) {
-    console.error(`[claude-completion] Document not found: ${params.textDocument.uri}`);
-    return [];
-  }
-
-  const text = document.getText();
+/**
+ * Get context around cursor (reduced for faster processing)
+ */
+function getContextAroundCursor(
+  text: string,
+  line: number,
+  contextLines: number = 30
+): string {
   const lines = text.split("\n");
-  const line = lines[params.position.line] || "";
-  const prefix = line.substring(0, params.position.character);
-
-  // Extract language from file extension
-  const uri = params.textDocument.uri;
-  const ext = uri.split(".").pop() || "";
-  const languageMap: Record<string, string> = {
-    py: "python",
-    ts: "typescript",
-    tsx: "typescript",
-    js: "javascript",
-    jsx: "javascript",
-    lua: "lua",
-    rs: "rust",
-    go: "go",
-    java: "java",
-    cpp: "cpp",
-    c: "c",
-    rb: "ruby",
-    php: "php",
-  };
-  const language = languageMap[ext] || ext;
-
-  // Get filename from URI
-  const filename = uri.split("/").pop() || "unknown";
-
-  console.error(
-    `[claude-completion] Completion request: ${filename}:${params.position.line}:${params.position.character}`
-  );
-  console.error(`[claude-completion] Prefix: "${prefix}"`);
-
-  try {
-    // Use Claude Agent SDK to get completions (uses Max subscription auth)
-    const sdkOptions: Options = {
-      model: "claude-haiku-4-5",
-      maxTurns: 1, // Direct response, no tools needed
-    };
-
-    const promptText = `You are a code completion engine. Generate completions for the prefix "${prefix}" at line ${params.position.line + 1}.
-
-FILE CONTENT (${filename}):
-\`\`\`${language}
-${text}
-\`\`\`
-
-CURSOR: Line ${params.position.line + 1}, after "${prefix}"
-
-RESPOND WITH ONLY A JSON ARRAY. NO OTHER TEXT.
-Format: [{"label": "text", "detail": "description", "kind": "function|variable|class"}]`;
-
-    // Add timeout to prevent hanging (30s for tool call + response)
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error("Claude API timeout")), 30000);
-    });
-
-    const queryPromise = (async () => {
-      let lastText = "";
-
-      for await (const message of query({
-        prompt: promptText,
-        options: sdkOptions,
-      })) {
-        console.error(`[claude-completion] Message type: ${message.type}`);
-
-        // Handle 'result' type messages (Claude SDK final result)
-        if (message.type === "result") {
-          const msg = message as { type: string; is_error?: boolean; result?: string };
-          console.error(`[claude-completion] Result: is_error=${msg.is_error}, result_length=${msg.result?.length}`);
-          console.error(`[claude-completion] Result content: ${msg.result?.substring(0, 500)}`);
-          if (!msg.is_error && msg.result) {
-            console.error(`[claude-completion] Got final result from Claude`);
-            const completions = parseCompletions(msg.result);
-            console.error(`[claude-completion] Parsed ${completions.length} completions from result`);
-            if (completions.length > 0) return completions;
-          }
-        }
-
-        // Collect assistant messages - look for JSON array with completions
-        if (message.type === "assistant") {
-          const betaMessage = (message as any).message;
-          if (betaMessage && betaMessage.content) {
-            for (const block of betaMessage.content) {
-              if (block.type === "text") {
-                const text = (block as { type: "text"; text: string }).text;
-                console.error(`[claude-completion] Assistant text: ${text.substring(0, 150)}`);
-
-                // Only parse if it looks like completion JSON
-                if (text.includes('[{') && text.includes('"label"')) {
-                  const completions = parseCompletions(text);
-                  if (completions.length > 0) {
-                    console.error(`[claude-completion] Found ${completions.length} completions in response`);
-                    return completions;
-                  }
-                }
-                lastText = text;
-              }
-            }
-          }
-        }
-      }
-
-      // Try parsing the last text we got
-      if (lastText) {
-        const completions = parseCompletions(lastText);
-        if (completions.length > 0) return completions;
-      }
-
-      return [];
-    })();
-
-    const completions = await Promise.race([queryPromise, timeoutPromise]);
-
-    // If Claude returned completions, use them; otherwise fall back to buffer
-    if (completions.length > 0) {
-      console.error(`[claude-completion] Returning ${completions.length} Claude completions`);
-      return completions;
-    }
-
-    console.error("[claude-completion] Claude returned 0 completions, using fallback");
-    return getBasicCompletions(text, prefix);
-  } catch (error) {
-    console.error("[claude-completion] Error getting completions:", error);
-
-    // Fallback: return basic buffer completions
-    return getBasicCompletions(text, prefix);
-  }
-});
+  const start = Math.max(0, line - contextLines);
+  const end = Math.min(lines.length, line + contextLines);
+  return lines.slice(start, end).join("\n");
+}
 
 /**
  * Fallback: Get basic completions from buffer words
@@ -220,19 +118,219 @@ function getBasicCompletions(text: string, prefix: string): CompletionItem[] {
   let match;
 
   while ((match = wordRegex.exec(text)) !== null) {
-    if (match[0].toLowerCase().startsWith(prefix.toLowerCase()) && match[0] !== prefix) {
+    if (
+      match[0].toLowerCase().startsWith(prefix.toLowerCase()) &&
+      match[0] !== prefix
+    ) {
       words.add(match[0]);
     }
   }
 
   return Array.from(words)
-    .slice(0, 20)
+    .slice(0, 10)
     .map((word) => ({
       label: word,
       kind: CompletionItemKind.Text,
       detail: "(buffer)",
+      sortText: "z" + word, // Sort buffer completions last
     }));
 }
+
+// Handle completion requests with streaming
+connection.onRequest(
+  CompletionRequest.type,
+  async (params): Promise<CompletionList> => {
+    const startTime = Date.now();
+    const document = documents.get(params.textDocument.uri);
+    if (!document) {
+      console.error(
+        `[claude-completion] Document not found: ${params.textDocument.uri}`
+      );
+      return { isIncomplete: false, items: [] };
+    }
+
+    const text = document.getText();
+    const lines = text.split("\n");
+    const line = lines[params.position.line] || "";
+    const prefix = line.substring(0, params.position.character);
+
+    // Skip if prefix is too short or empty
+    if (prefix.trim().length < 2) {
+      return { isIncomplete: false, items: getBasicCompletions(text, prefix) };
+    }
+
+    // Extract language from file extension
+    const uri = params.textDocument.uri;
+    const ext = uri.split(".").pop() || "";
+    const languageMap: Record<string, string> = {
+      py: "python",
+      ts: "typescript",
+      tsx: "typescript",
+      js: "javascript",
+      jsx: "javascript",
+      lua: "lua",
+      rs: "rust",
+      go: "go",
+      java: "java",
+      cpp: "cpp",
+      c: "c",
+      rb: "ruby",
+      php: "php",
+    };
+    const language = languageMap[ext] || ext;
+    const filename = uri.split("/").pop() || "unknown";
+
+    console.error(
+      `[claude-completion] Completion request: ${filename}:${params.position.line}:${params.position.character}`
+    );
+    console.error(`[claude-completion] Prefix: "${prefix}"`);
+
+    // Get immediate buffer completions
+    const bufferCompletions = getBasicCompletions(text, prefix);
+
+    // Cancel any existing request for this document
+    const requestKey = uri;
+    const existingRequest = pendingRequests.get(requestKey);
+    if (existingRequest) {
+      existingRequest.abort();
+    }
+
+    // Create abort controller for this request
+    const abortController = new AbortController();
+    pendingRequests.set(requestKey, abortController);
+
+    try {
+      // Use reduced context for faster processing
+      const context = getContextAroundCursor(text, params.position.line, 30);
+
+      // Optimized prompt - shorter and more direct
+      const promptText = `Complete code at cursor. Prefix: "${prefix}"
+
+\`\`\`${language}
+${context}
+\`\`\`
+
+JSON array only: [{"label":"completion","detail":"desc","kind":"function|variable|class"}]`;
+
+      const sdkOptions: Options = {
+        model: "claude-haiku-4-5",
+        maxTurns: 1,
+      };
+
+      // Race between Claude response and a short timeout
+      // Return buffer completions quickly, Claude completions if fast enough
+      const claudePromise = (async () => {
+        let accumulated = "";
+
+        for await (const message of query({
+          prompt: promptText,
+          options: sdkOptions,
+        })) {
+          // Check if request was cancelled
+          if (abortController.signal.aborted) {
+            console.error("[claude-completion] Request cancelled");
+            return [];
+          }
+
+          if (message.type === "result") {
+            const msg = message as {
+              type: string;
+              is_error?: boolean;
+              result?: string;
+            };
+            if (!msg.is_error && msg.result) {
+              const completions = parseCompletions(msg.result);
+              const elapsed = Date.now() - startTime;
+              console.error(
+                `[claude-completion] Got ${completions.length} completions in ${elapsed}ms`
+              );
+              return completions;
+            }
+          }
+
+          // Try to parse incrementally from assistant messages
+          if (message.type === "assistant") {
+            const betaMessage = (message as any).message;
+            if (betaMessage?.content) {
+              for (const block of betaMessage.content) {
+                if (block.type === "text") {
+                  accumulated += block.text;
+                  // Try to parse as soon as we have what looks like complete JSON
+                  if (accumulated.includes("[{") && accumulated.includes("}]")) {
+                    const completions = parseCompletions(accumulated);
+                    if (completions.length > 0) {
+                      const elapsed = Date.now() - startTime;
+                      console.error(
+                        `[claude-completion] Early parse: ${completions.length} completions in ${elapsed}ms`
+                      );
+                      return completions;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Final attempt to parse accumulated text
+        if (accumulated) {
+          return parseCompletions(accumulated);
+        }
+        return [];
+      })();
+
+      // Use a short timeout - if Claude is slow, return buffer completions
+      // and mark as incomplete so the editor might re-request
+      const timeoutPromise = new Promise<CompletionItem[]>((resolve) => {
+        setTimeout(() => {
+          console.error("[claude-completion] Timeout - returning buffer completions");
+          resolve([]);
+        }, 8000); // 8 second timeout (SDK has ~6-7s baseline)
+      });
+
+      const claudeCompletions = await Promise.race([
+        claudePromise,
+        timeoutPromise,
+      ]);
+
+      // Clean up
+      pendingRequests.delete(requestKey);
+
+      // Combine results - Claude completions first, then buffer
+      const allCompletions: CompletionItem[] = [];
+
+      // Add Claude completions with high priority
+      for (const item of claudeCompletions) {
+        allCompletions.push({
+          ...item,
+          sortText: "a" + item.label, // Sort Claude completions first
+        });
+      }
+
+      // Add buffer completions as fallback
+      for (const item of bufferCompletions) {
+        // Don't duplicate items
+        if (!allCompletions.some((c) => c.label === item.label)) {
+          allCompletions.push(item);
+        }
+      }
+
+      const elapsed = Date.now() - startTime;
+      console.error(
+        `[claude-completion] Returning ${allCompletions.length} completions (${claudeCompletions.length} Claude, ${bufferCompletions.length} buffer) in ${elapsed}ms`
+      );
+
+      return {
+        isIncomplete: claudeCompletions.length === 0, // Re-request if no Claude results
+        items: allCompletions,
+      };
+    } catch (error) {
+      pendingRequests.delete(requestKey);
+      console.error("[claude-completion] Error:", error);
+      return { isIncomplete: false, items: bufferCompletions };
+    }
+  }
+);
 
 // Start listening
 connection.listen();
