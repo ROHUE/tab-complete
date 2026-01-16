@@ -117,7 +117,7 @@ connection.onRequest(CompletionRequest.type, async (params): Promise<CompletionI
   try {
     // Use Claude Agent SDK to get completions (uses Max subscription auth)
     const sdkOptions: Options = {
-      model: "claude-sonnet-4-5",
+      model: "claude-haiku-4-5",
       maxTurns: 1, // Direct response, no tools needed
     };
 
