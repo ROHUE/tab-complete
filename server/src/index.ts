@@ -12,7 +12,7 @@ import {
   StreamMessageReader,
   StreamMessageWriter,
   type MessageConnection,
-} from "vscode-jsonrpc/node";
+} from "vscode-jsonrpc/node.js";
 import {
   InitializeRequest,
   InitializeResult,
@@ -23,15 +23,12 @@ import {
   TextDocumentSyncKind,
 } from "vscode-languageserver-protocol";
 import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
-import { createCompletionServer, parseCompletions } from "./completion-tool";
+import { parseCompletions } from "./completion-tool.js";
 
 console.error("[claude-completion] Starting server...");
 
 // Document storage (simple in-memory store)
 const documents = new Map<string, TextDocument>();
-
-// Create the Claude completion MCP server
-const completionServer = createCompletionServer();
 
 // Create a simple JSON-RPC connection using explicit stdio
 const reader = new StreamMessageReader(process.stdin);
@@ -120,45 +117,79 @@ connection.onRequest(CompletionRequest.type, async (params): Promise<CompletionI
   try {
     // Use Claude Agent SDK to get completions (uses Max subscription auth)
     const sdkOptions: Options = {
-      mcpServers: {
-        completions: completionServer,
-      },
-      allowedTools: ["mcp__completions__get_completions"],
-      maxTurns: 1,
+      model: "claude-sonnet-4-5",
+      maxTurns: 1, // Direct response, no tools needed
     };
 
-    const promptText = `Use the get_completions tool with these parameters:
-- buffer_content: ${JSON.stringify(text)}
-- cursor_line: ${params.position.line}
-- cursor_column: ${params.position.character}
-- language: "${language}"
-- prefix: ${JSON.stringify(prefix)}
-- filename: "${filename}"
+    const promptText = `You are a code completion engine. Generate completions for the prefix "${prefix}" at line ${params.position.line + 1}.
 
-Then analyze the code context and provide intelligent completions.`;
+FILE CONTENT (${filename}):
+\`\`\`${language}
+${text}
+\`\`\`
 
-    // Add timeout to prevent hanging
+CURSOR: Line ${params.position.line + 1}, after "${prefix}"
+
+RESPOND WITH ONLY A JSON ARRAY. NO OTHER TEXT.
+Format: [{"label": "text", "detail": "description", "kind": "function|variable|class"}]`;
+
+    // Add timeout to prevent hanging (30s for tool call + response)
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error("Claude API timeout")), 10000);
+      setTimeout(() => reject(new Error("Claude API timeout")), 30000);
     });
 
     const queryPromise = (async () => {
+      let lastText = "";
+
       for await (const message of query({
         prompt: promptText,
         options: sdkOptions,
       })) {
+        console.error(`[claude-completion] Message type: ${message.type}`);
+
+        // Handle 'result' type messages (Claude SDK final result)
+        if (message.type === "result") {
+          const msg = message as { type: string; is_error?: boolean; result?: string };
+          console.error(`[claude-completion] Result: is_error=${msg.is_error}, result_length=${msg.result?.length}`);
+          console.error(`[claude-completion] Result content: ${msg.result?.substring(0, 500)}`);
+          if (!msg.is_error && msg.result) {
+            console.error(`[claude-completion] Got final result from Claude`);
+            const completions = parseCompletions(msg.result);
+            console.error(`[claude-completion] Parsed ${completions.length} completions from result`);
+            if (completions.length > 0) return completions;
+          }
+        }
+
+        // Collect assistant messages - look for JSON array with completions
         if (message.type === "assistant") {
-          const betaMessage = message.message;
+          const betaMessage = (message as any).message;
           if (betaMessage && betaMessage.content) {
             for (const block of betaMessage.content) {
               if (block.type === "text") {
-                const textBlock = block as { type: "text"; text: string };
-                return parseCompletions(textBlock.text);
+                const text = (block as { type: "text"; text: string }).text;
+                console.error(`[claude-completion] Assistant text: ${text.substring(0, 150)}`);
+
+                // Only parse if it looks like completion JSON
+                if (text.includes('[{') && text.includes('"label"')) {
+                  const completions = parseCompletions(text);
+                  if (completions.length > 0) {
+                    console.error(`[claude-completion] Found ${completions.length} completions in response`);
+                    return completions;
+                  }
+                }
+                lastText = text;
               }
             }
           }
         }
       }
+
+      // Try parsing the last text we got
+      if (lastText) {
+        const completions = parseCompletions(lastText);
+        if (completions.length > 0) return completions;
+      }
+
       return [];
     })();
 

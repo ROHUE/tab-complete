@@ -1,6 +1,7 @@
 {
   "name": "claude-completion-server",
   "version": "1.0.0",
+  "type": "module",
   "description": "Claude-powered code completion LSP server",
   "main": "dist/index.js",
   "scripts": {
