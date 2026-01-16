@@ -285,7 +285,7 @@ JSON array only: [{"label":"completion","detail":"desc","kind":"function|variabl
         setTimeout(() => {
           console.error("[claude-completion] Timeout - returning buffer completions");
           resolve([]);
-        }, 8000); // 8 second timeout (SDK has ~6-7s baseline)
+        }, 15000); // 15 second timeout (SDK can take 10-15s)
       });
 
       const claudeCompletions = await Promise.race([
